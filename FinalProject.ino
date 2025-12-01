@@ -1,7 +1,7 @@
 #include <avr/io.h>
 #include <avr/interrupt.h>
 
-// States 
+// States
 typedef enum {
   STATE_DISABLED,
   STATE_IDLE,
@@ -9,54 +9,62 @@ typedef enum {
   STATE_ERROR
 } SystemState;
 
-volatile SystemState systemState = STATE_DISABLED;
-volatile uint8_t     startPending = 0;   
+volatile SystemState systemState      = STATE_DISABLED;
+volatile uint8_t     startPending     = 0;   
 
 
 #define LED_DDR       DDRA
 #define LED_PORT      PORTA
+
 #define LED_DISABLED_BIT  PA0   // pin 22 - Yellow
-#define LED_IDLE_BIT      PA1   // pin 23 - Green
-#define LED_ERROR_BIT     PA2   // pin 24 - Red
+#define LED_IDLE_BIT      PA1   // pin 23 -Green
+#define LED_ERROR_BIT     PA2   // pin 24 -Red
 #define LED_RUNNING_BIT   PA3   // pin 25 - Blue
-
-
-
 #define BUTTON_DDR       DDRC
 #define BUTTON_PORT      PORTC
 #define BUTTON_PIN_REG   PINC
 #define BUTTON_STOP_BIT  PC7      
 #define BUTTON_RESET_BIT PC6      
-
-
 #define BUTTON_START_BIT PE4      
 
+// Water sensor 
+static const unsigned char WATER_CHANNEL   = 0;    
+static unsigned int        WATER_THRESHOLD = 200;  
+
+volatile unsigned char *adcMux    = (unsigned char*) 0x7C; 
+volatile unsigned char *adcCtrlB  = (unsigned char*) 0x7B; 
+volatile unsigned char *adcCtrlA  = (unsigned char*) 0x7A; 
+volatile unsigned int  *adcData   = (unsigned int  *) 0x78; 
+
+void initAdc(void);
+unsigned int readAdc(unsigned char channel);
+uint8_t isWaterLow(void);
 
 void setupPins(void);
 void updateLeds(void);
-void handleButtonsAndState(void);
+void handleButtonsSensorsAndState(void);
 void setState(SystemState newState);
 
 
 void onStartButton()
 {
- 
+  
   startPending = 1;
 }
 
 void setup()
 {
   setupPins();
+  initAdc();   
   attachInterrupt(digitalPinToInterrupt(2), onStartButton, FALLING);
   systemState = STATE_DISABLED;
   updateLeds();
 }
+
 void loop()
 {
-  handleButtonsAndState();
+  handleButtonsSensorsAndState();
 }
-
-
 void setupPins(void)
 {
   
@@ -72,8 +80,8 @@ void setupPins(void)
                 (1 << LED_RUNNING_BIT));
 
   
-  BUTTON_DDR  &= ~((1 << BUTTON_STOP_BIT) | (1 << BUTTON_RESET_BIT)); 
-  BUTTON_PORT |=  (1 << BUTTON_STOP_BIT) | (1 << BUTTON_RESET_BIT);   
+  BUTTON_DDR  &= ~((1 << BUTTON_STOP_BIT) | (1 << BUTTON_RESET_BIT)); // inputs
+  BUTTON_PORT |=  (1 << BUTTON_STOP_BIT) | (1 << BUTTON_RESET_BIT);   // pull-ups
 
   
   DDRE  &= ~(1 << BUTTON_START_BIT);
@@ -115,7 +123,7 @@ void setState(SystemState newState)
 }
 
 
-void handleButtonsAndState(void)
+void handleButtonsSensorsAndState(void)
 {
   // Buttons
   uint8_t buttonPins   = BUTTON_PIN_REG;
@@ -129,19 +137,83 @@ void handleButtonsAndState(void)
     if (systemState == STATE_DISABLED) {
       setState(STATE_IDLE);
     }
+   
   }
 
-  // Stop -> DISABLED
+  
   if (stopPressed) {
     setState(STATE_DISABLED);
     return;   
   }
 
-  // Reset 
+  /
   if (resetPressed && systemState == STATE_ERROR) {
-    setState(STATE_IDLE);
+    
+    if (!isWaterLow()) {
+      setState(STATE_IDLE);
+    }
+  }
+
+  
+  if (systemState == STATE_IDLE || systemState == STATE_RUNNING) {
+    if (isWaterLow()) {
+      setState(STATE_ERROR);
+    }
   }
 
  
 }
 
+
+
+void initAdc(void) 
+{
+ 
+  *adcCtrlA = (1 << 7)               
+            | (0 << 5)               
+            | (0 << 3)               
+            | (1 << 2) | (1 << 1) | (1 << 0); 
+
+
+  *adcCtrlB = (0 << 3)               
+            | (0 << 2) | (0 << 1) | (0 << 0); 
+
+  
+  *adcMux  = (0 << 7)                
+           | (1 << 6)                
+           | (0 << 5)             
+           | (0x00);                 
+}
+
+unsigned int readAdc(unsigned char channel)
+{
+  channel &= 0x07;   
+
+  
+  *adcMux = (*adcMux & 0xE0) | (channel & 0x1F);
+
+  
+  *adcCtrlB &= ~(1 << 3); 
+
+  
+  *adcCtrlA |= (1 << 6);
+
+
+  while ((*adcCtrlA & (1 << 6)) != 0) {
+    
+  }
+  unsigned int value = *adcData;
+  return value;
+}
+
+uint8_t isWaterLow(void)
+{
+  unsigned int reading = readAdc(WATER_CHANNEL);
+
+
+  if (reading <= WATER_THRESHOLD) {
+    return 1;   
+  } else {
+    return 0;  
+  }
+}
