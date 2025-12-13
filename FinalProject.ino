@@ -2,6 +2,8 @@
 #include <avr/interrupt.h>
 #include <DHT.h>   
 #include <LiquidCrystal.h>  
+#include <Wire.h>
+#include <RTClib.h>
 
 //System state
 typedef enum {
@@ -18,8 +20,8 @@ volatile uint8_t    startPending = 0;
 #define LED_DDR  DDRA
 #define LED_PORT PORTA
 
-// Yellow= disabled, Green = idle, Red= error,Blue = running
-#define LED_DISABLED_BIT PA0    // pin 22= Yellow
+// Yellow= disabled, Green = idle, Red = error,Blue = running
+#define LED_DISABLED_BIT PA0    // pin 22 = Yellow
 #define LED_IDLE_BIT     PA1    // pin 23 = Green
 #define LED_ERROR_BIT    PA2    // pin 24 = Red
 #define LED_RUNNING_BIT  PA3    // pin 25 = Blue
@@ -100,6 +102,13 @@ const char* stateToString(SystemState s);
 void logStateChange(SystemState oldState, SystemState newState);
 void logStatusIfNeeded(void);
 
+// RTC
+RTC_DS3231 rtc;
+uint8_t rtcOK = 0;
+void initRtc(void);
+void logWithTimestampPrefix(void);
+void uartPrint2Digit(uint8_t v);
+
 // Prototypes
 void setupPins(void);
 void updateLeds(void);
@@ -119,6 +128,7 @@ void setup()
   setupPins();
   initAdc();
   uartInit(9600);
+  initRtc();
   dht.begin();  
 
   lcd.begin(16, 2);
@@ -135,6 +145,7 @@ void setup()
   updateLeds();
   updateFan();  
 
+  logWithTimestampPrefix();
   uartPrintStr("System booted. State=DISABLED");
   uartPrintNewline();
 }
@@ -172,8 +183,6 @@ void setupPins(void)
   LED_DDR |= (1 << LED_DISABLED_BIT) | (1 << LED_IDLE_BIT) | (1 << LED_ERROR_BIT) | (1 << LED_RUNNING_BIT);
 
   LED_PORT &= ~((1 << LED_DISABLED_BIT) | (1 << LED_IDLE_BIT) | (1 << LED_ERROR_BIT) | (1 << LED_RUNNING_BIT));
-
-
 
   // Fan output on PH3 (D6)
   FAN_DDR  |= (1 << FAN_BIT);
@@ -516,6 +525,7 @@ const char* stateToString(SystemState s)
 
 void logStateChange(SystemState oldState, SystemState newState)
 {
+  logWithTimestampPrefix();
   uartPrintStr("State change: ");
   uartPrintStr(stateToString(oldState));
   uartPrintStr(" -> ");
@@ -557,4 +567,55 @@ void logStatusIfNeeded(void)
     uartPutChar(isWaterLow() ? '1' : '0');
     uartPrintNewline();
   }
+}
+
+// RTC helpers
+void initRtc(void)
+{
+  Wire.begin();
+
+  if (!rtc.begin()) {
+    rtcOK = 0;
+    uartPrintStr("RTC init failed");
+    uartPrintNewline();
+    return;
+  }
+
+  rtcOK = 1;
+
+  uartPrintStr("RTC initialized");
+  uartPrintNewline();
+}
+
+void uartPrint2Digit(uint8_t v)
+{
+  if (v < 10) {
+    uartPutChar('0');
+  }
+  uartPrintUint((unsigned int)v);
+}
+
+void logWithTimestampPrefix(void)
+{
+  if (!rtcOK) {
+    uartPrintStr("[no-RTC] ");
+    return;
+  }
+
+  DateTime now = rtc.now();
+
+  uartPutChar('[');
+  uartPrintUint(now.year());
+  uartPutChar('-');
+  uartPrint2Digit(now.month());
+  uartPutChar('-');
+  uartPrint2Digit(now.day());
+  uartPutChar(' ');
+  uartPrint2Digit(now.hour());
+  uartPutChar(':');
+  uartPrint2Digit(now.minute());
+  uartPutChar(':');
+  uartPrint2Digit(now.second());
+  uartPutChar(']');
+  uartPutChar(' ');
 }
