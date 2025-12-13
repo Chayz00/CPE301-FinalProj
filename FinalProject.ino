@@ -1,6 +1,7 @@
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <DHT.h>   
+#include <LiquidCrystal.h>  // NEW for v5
 
 //System state
 typedef enum {
@@ -61,6 +62,18 @@ void updateDhtIfNeeded(void);
 const uint8_t TEMP_ON_THRESHOLD  = 26;  // go to RUNNING when >= 26
 const uint8_t TEMP_OFF_THRESHOLD = 24;  // go back to IDLE when <= 24
 
+// ===== LCD (16x2) =====
+// Pins: RS=8, E=9, D4=10, D5=11, D6=12, D7=13
+LiquidCrystal lcd(8, 9, 10, 11, 12, 13);
+
+// 5s for testing; change to 60000UL later for 60s
+const unsigned long LCD_UPDATE_PERIOD_MS = 5000UL;
+
+unsigned long lcdLastUpdateMs = 0;
+uint8_t disabledScreenShown   = 0;
+
+void updateLcdIfNeeded(void);
+
 //UART0
 #define RDA 0x80
 #define TBE 0x20
@@ -102,6 +115,14 @@ void setup()
   uartInit(9600);
   dht.begin();  
 
+  lcd.begin(16, 2);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Swamp Cooler");
+  lcd.setCursor(0, 1);
+  lcd.print("DISABLED");
+  disabledScreenShown = 1;
+
   attachInterrupt(digitalPinToInterrupt(2), onStartButton, FALLING);
 
   systemState = STATE_DISABLED;
@@ -117,8 +138,23 @@ void loop()
 
   // No monitoring/logging in DISABLED
   if (systemState != STATE_DISABLED) {
+    // We are in an active state; next time we enter DISABLED
+    // we want to redraw the "Cooler OFF" message.
+    disabledScreenShown = 0;
+
     updateDhtIfNeeded();
     logStatusIfNeeded();   
+    updateLcdIfNeeded();
+  } else {
+    // In DISABLED, show "Cooler OFF / Press START" once per entry
+    if (!disabledScreenShown) {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Cooler OFF");
+      lcd.setCursor(0, 1);
+      lcd.print("Press START");
+      disabledScreenShown = 1;
+    }
   }
 }
 
@@ -126,15 +162,9 @@ void loop()
 void setupPins(void)
 {
   // LED 
-  LED_DDR |= (1 << LED_DISABLED_BIT) |
-             (1 << LED_IDLE_BIT)     |
-             (1 << LED_ERROR_BIT)    |
-             (1 << LED_RUNNING_BIT);
+  LED_DDR |= (1 << LED_DISABLED_BIT) | (1 << LED_IDLE_BIT) | (1 << LED_ERROR_BIT) | (1 << LED_RUNNING_BIT);
 
-  LED_PORT &= ~((1 << LED_DISABLED_BIT) |
-                (1 << LED_IDLE_BIT)     |
-                (1 << LED_ERROR_BIT)    |
-                (1 << LED_RUNNING_BIT));
+  LED_PORT &= ~((1 << LED_DISABLED_BIT) | (1 << LED_IDLE_BIT) | (1 << LED_ERROR_BIT) | (1 << LED_RUNNING_BIT));
 
   // Stop & Reset button
   BUTTON_DDR  &= ~((1 << BUTTON_STOP_BIT) | (1 << BUTTON_RESET_BIT)); // inputs
@@ -143,16 +173,13 @@ void setupPins(void)
   // Start button 
   DDRE  &= ~(1 << BUTTON_START_BIT);
   PORTE |=  (1 << BUTTON_START_BIT);
-
-  
 }
 
 //LED update 
 void updateLeds(void)
 {
   // All off
-  LED_PORT &= ~((1 << LED_DISABLED_BIT) | (1 << LED_IDLE_BIT)  | (1 << LED_ERROR_BIT) | (1 << LED_RUNNING_BIT));
-
+  LED_PORT &= ~((1 << LED_DISABLED_BIT) | (1 << LED_IDLE_BIT)   |  (1 << LED_ERROR_BIT)  | (1 << LED_RUNNING_BIT));
   switch (systemState) {
     case STATE_DISABLED:
       LED_PORT |= (1 << LED_DISABLED_BIT);  // Yellow
@@ -177,6 +204,12 @@ void setState(SystemState newState)
     systemState = newState;
     updateLeds();
     logStateChange(oldState, newState);
+
+    //  reset LCD
+    lcdLastUpdateMs = 0;
+    if (systemState == STATE_DISABLED) {
+      disabledScreenShown = 0;
+    }
   }
 }
 
@@ -217,11 +250,13 @@ void handleButtonsSensorsAndState(void)
       return;   
     }
   }
- //Check for valid 
+
+  //Check valid  
   if (!hasValidDht) {
     return;
   }
- // Check water level 
+
+  // Check water level and temp thresholds
   if (!isWaterLow()) {
     if (systemState == STATE_IDLE && currentTempC >= TEMP_ON_THRESHOLD) {
       setState(STATE_RUNNING);
@@ -296,6 +331,59 @@ void updateDhtIfNeeded(void)
   currentHumidity = (int)h;
   currentTempC    = (int)t;
   hasValidDht     = 1;
+}
+
+//LCD helper
+void updateLcdIfNeeded(void)
+{
+  if (systemState == STATE_DISABLED) {
+    return;
+  }
+
+  unsigned long now = millis();
+  if (now - lcdLastUpdateMs < LCD_UPDATE_PERIOD_MS) {
+    return;
+  }
+  lcdLastUpdateMs = now;
+
+  lcd.clear();
+
+  // Line 0
+  if (systemState == STATE_ERROR) {
+    lcd.setCursor(0, 0);
+    lcd.print("Error: Low Water");
+  } else {
+    lcd.setCursor(0, 0);
+    if (hasValidDht) {
+      lcd.print("T:");
+      lcd.print(currentTempC);
+      lcd.print("C H:");
+      lcd.print(currentHumidity);
+      lcd.print("%");
+    } else {
+      lcd.print("T:--C H:--%");
+    }
+  }
+
+  // Line 1
+  lcd.setCursor(0, 1);
+  if (systemState == STATE_IDLE) {
+    lcd.print("Mode: IDLE    ");
+  } else if (systemState == STATE_RUNNING) {
+    lcd.print("Mode: RUN     ");
+  } else if (systemState == STATE_ERROR) {
+    if (hasValidDht) {
+      lcd.print("T:");
+      lcd.print(currentTempC);
+      lcd.print("C H:");
+      lcd.print(currentHumidity);
+      lcd.print("%");
+    } else {
+      lcd.print("T:--C H:--%");
+    }
+  } else {
+    lcd.print("Unknown state ");
+  }
 }
 
 //  UART helpers
