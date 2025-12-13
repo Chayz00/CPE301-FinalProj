@@ -1,7 +1,7 @@
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <DHT.h>   
-#include <LiquidCrystal.h>  // NEW for v5
+#include <LiquidCrystal.h>  
 
 //System state
 typedef enum {
@@ -15,7 +15,7 @@ volatile SystemState systemState = STATE_DISABLED;
 volatile uint8_t    startPending = 0;   
 
 // LED pins (22–25 = PA0–PA3)
-#define LED_DDR DDRA
+#define LED_DDR  DDRA
 #define LED_PORT PORTA
 
 // Yellow= disabled, Green = idle, Red= error,Blue = running
@@ -23,6 +23,12 @@ volatile uint8_t    startPending = 0;
 #define LED_IDLE_BIT     PA1    // pin 23 = Green
 #define LED_ERROR_BIT    PA2    // pin 24 = Red
 #define LED_RUNNING_BIT  PA3    // pin 25 = Blue
+
+// Fan output
+// Arduino digital pin 6 = PH3
+#define FAN_DDR   DDRH
+#define FAN_PORT  PORTH
+#define FAN_BIT   PH3          // pin 6
 
 //Buttons 
 #define BUTTON_DDR       DDRC
@@ -62,12 +68,11 @@ void updateDhtIfNeeded(void);
 const uint8_t TEMP_ON_THRESHOLD  = 26;  // go to RUNNING when >= 26
 const uint8_t TEMP_OFF_THRESHOLD = 24;  // go back to IDLE when <= 24
 
-// ===== LCD (16x2) =====
+// LCD 
 // Pins: RS=8, E=9, D4=10, D5=11, D6=12, D7=13
 LiquidCrystal lcd(8, 9, 10, 11, 12, 13);
 
-// 5s for testing; change to 60000UL later for 60s
-const unsigned long LCD_UPDATE_PERIOD_MS = 5000UL;
+const unsigned long LCD_UPDATE_PERIOD_MS = 60000UL;
 
 unsigned long lcdLastUpdateMs = 0;
 uint8_t disabledScreenShown   = 0;
@@ -100,6 +105,7 @@ void setupPins(void);
 void updateLeds(void);
 void handleButtonsSensorsAndState(void);
 void setState(SystemState newState);
+void updateFan(void);   
 
 // Start button callback
 void onStartButton()
@@ -127,6 +133,8 @@ void setup()
 
   systemState = STATE_DISABLED;
   updateLeds();
+  updateFan();  
+
   uartPrintStr("System booted. State=DISABLED");
   uartPrintNewline();
 }
@@ -135,11 +143,10 @@ void setup()
 void loop()
 {
   handleButtonsSensorsAndState();
+  updateFan(); 
 
   // No monitoring/logging in DISABLED
   if (systemState != STATE_DISABLED) {
-    // We are in an active state; next time we enter DISABLED
-    // we want to redraw the "Cooler OFF" message.
     disabledScreenShown = 0;
 
     updateDhtIfNeeded();
@@ -166,6 +173,12 @@ void setupPins(void)
 
   LED_PORT &= ~((1 << LED_DISABLED_BIT) | (1 << LED_IDLE_BIT) | (1 << LED_ERROR_BIT) | (1 << LED_RUNNING_BIT));
 
+
+
+  // Fan output on PH3 (D6)
+  FAN_DDR  |= (1 << FAN_BIT);
+  FAN_PORT &= ~(1 << FAN_BIT);   // fan off initially
+
   // Stop & Reset button
   BUTTON_DDR  &= ~((1 << BUTTON_STOP_BIT) | (1 << BUTTON_RESET_BIT)); // inputs
   BUTTON_PORT |=  (1 << BUTTON_STOP_BIT) | (1 << BUTTON_RESET_BIT);   // pull-ups
@@ -180,6 +193,7 @@ void updateLeds(void)
 {
   // All off
   LED_PORT &= ~((1 << LED_DISABLED_BIT) | (1 << LED_IDLE_BIT)   |  (1 << LED_ERROR_BIT)  | (1 << LED_RUNNING_BIT));
+
   switch (systemState) {
     case STATE_DISABLED:
       LED_PORT |= (1 << LED_DISABLED_BIT);  // Yellow
@@ -196,6 +210,17 @@ void updateLeds(void)
   }
 }
 
+// Fan update
+// Fan ON only in RUNNING
+void updateFan(void)
+{
+  if (systemState == STATE_RUNNING) {
+    FAN_PORT |=  (1 << FAN_BIT);   // fan ON
+  } else {
+    FAN_PORT &= ~(1 << FAN_BIT);   // fan OFF
+  }
+}
+
 // State Change
 void setState(SystemState newState)
 {
@@ -205,7 +230,7 @@ void setState(SystemState newState)
     updateLeds();
     logStateChange(oldState, newState);
 
-    //  reset LCD
+    // reset LCD timer on every state change
     lcdLastUpdateMs = 0;
     if (systemState == STATE_DISABLED) {
       disabledScreenShown = 0;
@@ -216,10 +241,39 @@ void setState(SystemState newState)
 // Buttons + water sensor + state 
 void handleButtonsSensorsAndState(void)
 {
-  // Buttons
-  uint8_t buttonPins   = BUTTON_PIN_REG;
-  uint8_t stopPressed  = !(buttonPins & (1 << BUTTON_STOP_BIT));   // active low
-  uint8_t resetPressed = !(buttonPins & (1 << BUTTON_RESET_BIT));  // active low
+  unsigned long now = millis();
+  uint8_t buttonPins = BUTTON_PIN_REG;
+  uint8_t stopRaw    = !(buttonPins & (1 << BUTTON_STOP_BIT));   // active low
+  uint8_t resetRaw   = !(buttonPins & (1 << BUTTON_RESET_BIT));  // active low
+
+  // Debounce STOP
+  static uint8_t       stopStable     = 0;
+  static uint8_t       stopLastRaw    = 0;
+  static unsigned long stopLastChange = 0;
+
+  if (stopRaw != stopLastRaw) {
+    stopLastRaw    = stopRaw;
+    stopLastChange = now;
+  }
+  if ((now - stopLastChange) > 50) {   // 50 ms debounce
+    stopStable = stopRaw;
+  }
+
+  // Debounce RESET
+  static uint8_t       resetStable     = 0;
+  static uint8_t       resetLastRaw    = 0;
+  static unsigned long resetLastChange = 0;
+
+  if (resetRaw != resetLastRaw) {
+    resetLastRaw    = resetRaw;
+    resetLastChange = now;
+  }
+  if ((now - resetLastChange) > 50) {
+    resetStable = resetRaw;
+  }
+
+  uint8_t stopPressed  = stopStable;
+  uint8_t resetPressed = resetStable;
 
   // Start 
   if (startPending) {
@@ -251,12 +305,12 @@ void handleButtonsSensorsAndState(void)
     }
   }
 
-  //Check valid  
+  //Check for valid DHT
   if (!hasValidDht) {
     return;
   }
 
-  // Check water level and temp thresholds
+  // Check water level & temp thresholds
   if (!isWaterLow()) {
     if (systemState == STATE_IDLE && currentTempC >= TEMP_ON_THRESHOLD) {
       setState(STATE_RUNNING);
