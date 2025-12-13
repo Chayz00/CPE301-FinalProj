@@ -1,87 +1,151 @@
 #include <avr/io.h>
 #include <avr/interrupt.h>
-#include <DHT.h>   
-#include <LiquidCrystal.h>  
 #include <Wire.h>
-#include <RTClib.h>
+#include <RTClib.h>         
+#include <DHT.h>            
+#include <LiquidCrystal.h>  
+#include <Stepper.h>        
 
-//System state
-typedef enum {
-  STATE_DISABLED,
-  STATE_IDLE,
-  STATE_RUNNING,
-  STATE_ERROR
-} SystemState;
+// Pin assignments 
 
-volatile SystemState systemState = STATE_DISABLED;
-volatile uint8_t    startPending = 0;   
+// LEDs  
+const uint8_t PIN_LED_DISABLED = 22; // Yellow -> PA0
+const uint8_t PIN_LED_IDLE     = 23; // Green  -> PA1
+const uint8_t PIN_LED_ERROR    = 24; // Red    -> PA2
+const uint8_t PIN_LED_RUNNING  = 25; // Blue   -> PA3
 
-// LED pins (22–25 = PA0–PA3)
-#define LED_DDR  DDRA
-#define LED_PORT PORTA
+// Buttons
+const uint8_t PIN_BTN_START = 2;   // Start -> PE4 (INT4)
+const uint8_t PIN_BTN_STOP  = 30;  // Stop  -> PC7
+const uint8_t PIN_BTN_RESET = 31;  // Reset -> PC6
 
-// Yellow= disabled, Green = idle, Red = error,Blue = running
-#define LED_DISABLED_BIT PA0    // pin 22 = Yellow
-#define LED_IDLE_BIT     PA1    // pin 23 = Green
-#define LED_ERROR_BIT    PA2    // pin 24 = Red
-#define LED_RUNNING_BIT  PA3    // pin 25 = Blue
+// Fan control (D6 -> PH3)
+const uint8_t PIN_FAN = 6;
 
-// Fan output
-// Arduino digital pin 6 = PH3
+// DHT11
+const uint8_t PIN_DHT = 7;
+#define DHTTYPE DHT11
+
+// Water sensor (ADC channel 0 -> A0)
+const uint8_t WATER_ADC_CHANNEL = 0;
+
+// Pot for stepper control (A1 -> ADC channel 1)
+const uint8_t PIN_VENT_POT = A1;
+
+// Stepper pins  IN1–IN4
+const uint8_t PIN_STEP_IN1 = 32;
+const uint8_t PIN_STEP_IN2 = 33;
+const uint8_t PIN_STEP_IN3 = 34;
+const uint8_t PIN_STEP_IN4 = 35;
+
+//GPIO
+
+// LEDs on PORTA bits 0–3
+#define LED_DDR        DDRA
+#define LED_PORT       PORTA
+#define LED_DISABLED_BIT PA0    // pin 22
+#define LED_IDLE_BIT     PA1    // pin 23
+#define LED_ERROR_BIT    PA2    // pin 24
+#define LED_RUNNING_BIT  PA3    // pin 25
+
+// Fan on PORTH bit 3 (D6)
 #define FAN_DDR   DDRH
 #define FAN_PORT  PORTH
-#define FAN_BIT   PH3          // pin 6
+#define FAN_BIT   PH3
 
-//Buttons 
+// Stop & Reset buttons on PORTC bits 7 & 6
 #define BUTTON_DDR       DDRC
 #define BUTTON_PORT      PORTC
 #define BUTTON_PIN_REG   PINC
 #define BUTTON_STOP_BIT  PC7      // pin 30
 #define BUTTON_RESET_BIT PC6      // pin 31
 
-// Start PORTE (INT4 - pin 2)
-#define BUTTON_START_BIT PE4     // pin 2
+// Start button PORTE (INT4 - pin 2 = PE4)
+#define BUTTON_START_DDR  DDRE
+#define BUTTON_START_PORT PORTE
+#define BUTTON_START_BIT  PE4
 
-// Water sensor (ADC channel 0)
-static const unsigned char WATER_CHANNEL = 0;    // A0
-static unsigned int  WATER_THRESHOLD = 200;  
-
-volatile unsigned char *adcMux   = (unsigned char*) 0x7C;
-volatile unsigned char *adcCtrlB = (unsigned char*) 0x7B;
-volatile unsigned char *adcCtrlA = (unsigned char*) 0x7A;
-volatile unsigned int  *adcData  = (unsigned int  *) 0x78;
-
-void initAdc(void);
-unsigned int readAdc(unsigned char channel);
-uint8_t isWaterLow(void);
-
-//  DHT11 (temp/humidity)
-#define DHT_PIN   7
-#define DHT_TYPE  DHT11
-DHT dht(DHT_PIN, DHT_TYPE);
-
-int     currentTempC    = 0;
-int     currentHumidity = 0;
-uint8_t hasValidDht     = 0;
-
-void updateDhtIfNeeded(void);
-
-// Temp transition tresholds
-const uint8_t TEMP_ON_THRESHOLD  = 26;  // go to RUNNING when >= 26
-const uint8_t TEMP_OFF_THRESHOLD = 24;  // go back to IDLE when <= 24
-
-// LCD 
-// Pins: RS=8, E=9, D4=10, D5=11, D6=12, D7=13
+// LCD: RS, EN, D4, D5, D6, D7
 LiquidCrystal lcd(8, 9, 10, 11, 12, 13);
+DHT dht(PIN_DHT, DHTTYPE);
+RTC_DS3231 rtc;
 
-const unsigned long LCD_UPDATE_PERIOD_MS = 60000UL;
+// Stepper setup
+const int STEPS_PER_REV   = 2048;
+const int VENT_MAX_STEPS  = STEPS_PER_REV / 2; // 1024
+const int VENT_STEP_CHUNK = 8;
+const unsigned long VENT_UPDATE_MS = 50UL;
+Stepper ventStepper(STEPS_PER_REV, PIN_STEP_IN1, PIN_STEP_IN3, PIN_STEP_IN2, PIN_STEP_IN4);
+long ventCurrentSteps = 0; 
+unsigned long lastVentMillis = 0;
 
-unsigned long lcdLastUpdateMs = 0;
-uint8_t disabledScreenShown   = 0;
+// ADC 
+volatile unsigned char *my_ADMUX    = (unsigned char*) 0x7C;
+volatile unsigned char *my_ADCSRB   = (unsigned char*) 0x7B;
+volatile unsigned char *my_ADCSRA   = (unsigned char*) 0x7A;
+volatile unsigned int  *my_ADC_DATA = (unsigned int*)  0x78;
 
-void updateLcdIfNeeded(void);
+void adc_init() {
+  *my_ADCSRA = (1 << 7)        // ADEN: enable ADC
+             | (0 << 5)        // ADATE: auto trigger off
+             | (0 << 3)        // ADIE: interrupt off
+             | (1 << 2) | (1 << 1) | (1 << 0); // prescaler 128
 
-//UART0
+  *my_ADCSRB = 0x00;           // free running, MUX5=0
+  *my_ADMUX  = (0 << 7)        // REFS1
+             | (1 << 6)        // REFS0 -> AVCC
+             | (0 << 5)        // right adjust
+             | 0x00;           // start on channel 0
+}
+
+unsigned int adc_read(uint8_t adc_channel_num) {
+  adc_channel_num &= 0x07;
+  *my_ADMUX = (*my_ADMUX & 0xE0) | (adc_channel_num & 0x1F);
+  *my_ADCSRB &= ~(1 << 3);   // MUX5=0
+
+  *my_ADCSRA |= (1 << 6);    // ADSC: start
+
+  while ((*my_ADCSRA & (1 << 6)) != 0) { } // wait
+
+  return *my_ADC_DATA;
+}
+
+// State machine
+
+enum SystemState {
+  STATE_DISABLED,
+  STATE_IDLE,
+  STATE_RUNNING,
+  STATE_ERROR
+};
+
+volatile SystemState systemState = STATE_DISABLED;
+volatile bool startRequested = false;
+
+float currentTempC    = NAN;
+float currentHumidity = NAN;
+unsigned int waterAdc = 0;
+bool waterIsLow       = false;
+
+// thresholds
+const unsigned int WATER_ADC_THRESHOLD = 200; 
+const float TEMP_ON_C  = 26.0; // fan on
+const float TEMP_OFF_C = 25.0; // fan off
+
+// timing
+const unsigned long SENSOR_PERIOD_MS = 1000UL;
+const unsigned long LCD_PERIOD_MS    = 60000UL;
+const unsigned long STOP_DEBOUNCE_MS = 50UL;
+unsigned long lastSensorMillis = 0;
+unsigned long lastLcdMillis    = 0;
+unsigned long lastStopChangeMs = 0;
+int           lastStopLevel    = HIGH;
+bool          stopLatched      = false;
+
+// RTC 
+bool rtcOK = false;
+
+// UART0
 #define RDA 0x80
 #define TBE 0x20
 
@@ -92,137 +156,134 @@ volatile unsigned int  *uartBaud     = (unsigned int  *)0x00C4;
 volatile unsigned char *uartData     = (unsigned char *)0x00C6;
 
 void uartInit(int baud);
-unsigned char uartKbHit(void);
-unsigned char uartGetChar(void);
 void uartPutChar(unsigned char c);
 void uartPrintStr(const char *s);
 void uartPrintNewline(void);
 void uartPrintUint(unsigned int value);
-const char* stateToString(SystemState s);
-void logStateChange(SystemState oldState, SystemState newState);
-void logStatusIfNeeded(void);
-
-// RTC
-RTC_DS3231 rtc;
-uint8_t rtcOK = 0;
-void initRtc(void);
-void logWithTimestampPrefix(void);
 void uartPrint2Digit(uint8_t v);
 
 // Prototypes
-void setupPins(void);
-void updateLeds(void);
-void handleButtonsSensorsAndState(void);
+void initGPIO();
+void updateLeds();
+void updateFanOutput();
+void updateLcd();
+void sampleSensorsAndUpdateState();
+void handleButtons();
 void setState(SystemState newState);
-void updateFan(void);   
+const char* stateName(SystemState s);
+void initRTC();
+void logWithTimestampPrefix();
+void logStateChange(SystemState fromState, SystemState toState);
+void lcdPrint2Digit(int v);
+void updateVentFromPot();
 
-// Start button callback
-void onStartButton()
-{
-  startPending = 1;
+// ISR: Start button
+void onStartPressed() {
+  startRequested = true;  // falling edge = press
 }
 
 // Setup
-void setup()
-{
-  setupPins();
-  initAdc();
+
+void setup() {
   uartInit(9600);
-  initRtc();
-  dht.begin();  
-
+  initGPIO();
+  adc_init();
+  dht.begin();
   lcd.begin(16, 2);
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("Swamp Cooler");
-  lcd.setCursor(0, 1);
-  lcd.print("DISABLED");
-  disabledScreenShown = 1;
-
-  attachInterrupt(digitalPinToInterrupt(2), onStartButton, FALLING);
-
+  ventStepper.setSpeed(10); 
+  initRTC();
   systemState = STATE_DISABLED;
   updateLeds();
-  updateFan();  
-
+  updateFanOutput();
+  updateLcd();  
   logWithTimestampPrefix();
   uartPrintStr("System booted. State=DISABLED");
   uartPrintNewline();
 }
 
-// Loop
-void loop()
-{
-  handleButtonsSensorsAndState();
-  updateFan(); 
+// Main loop
+void loop() {
+  // start button from ISR
+  if (startRequested) {
+    noInterrupts();
+    bool localStart = startRequested;
+    startRequested = false;
+    interrupts();
 
-  // No monitoring/logging in DISABLED
-  if (systemState != STATE_DISABLED) {
-    disabledScreenShown = 0;
-
-    updateDhtIfNeeded();
-    logStatusIfNeeded();   
-    updateLcdIfNeeded();
-  } else {
-    // In DISABLED, show "Cooler OFF / Press START" once per entry
-    if (!disabledScreenShown) {
-      lcd.clear();
-      lcd.setCursor(0, 0);
-      lcd.print("Cooler OFF");
-      lcd.setCursor(0, 1);
-      lcd.print("Press START");
-      disabledScreenShown = 1;
+    if (localStart && systemState == STATE_DISABLED) {
+      setState(STATE_IDLE);
     }
+  }
+
+  handleButtons();
+
+  unsigned long now = millis();
+
+  // monitor sensors when enabled
+  if (systemState != STATE_DISABLED &&
+      (now - lastSensorMillis) >= SENSOR_PERIOD_MS) {
+    lastSensorMillis = now;
+    sampleSensorsAndUpdateState();
+  }
+
+  if ((now - lastLcdMillis) >= LCD_PERIOD_MS) {
+    lastLcdMillis = now;
+    updateLcd();
+  }
+
+  // Stepper update in all except DISABLED
+  if (systemState != STATE_DISABLED && (now - lastVentMillis) >= VENT_UPDATE_MS) {
+    lastVentMillis = now;
+    updateVentFromPot();
   }
 }
 
 // GPIO
-void setupPins(void)
-{
-  // LED 
-  LED_DDR |= (1 << LED_DISABLED_BIT) | (1 << LED_IDLE_BIT) | (1 << LED_ERROR_BIT) | (1 << LED_RUNNING_BIT);
 
-  LED_PORT &= ~((1 << LED_DISABLED_BIT) | (1 << LED_IDLE_BIT) | (1 << LED_ERROR_BIT) | (1 << LED_RUNNING_BIT));
+void initGPIO() {
+  // LEDs (PA0–PA3)
+  LED_DDR |= (1 << LED_DISABLED_BIT) | (1 << LED_IDLE_BIT)  | (1 << LED_ERROR_BIT) | (1 << LED_RUNNING_BIT);
 
-  // Fan output on PH3 (D6)
+  LED_PORT &= ~((1 << LED_DISABLED_BIT) | (1 << LED_IDLE_BIT)  | (1 << LED_ERROR_BIT) | (1 << LED_RUNNING_BIT));
+
+  // Fan (PH3)
   FAN_DDR  |= (1 << FAN_BIT);
-  FAN_PORT &= ~(1 << FAN_BIT);   // fan off initially
+  FAN_PORT &= ~(1 << FAN_BIT);   // fan off 
 
-  // Stop & Reset button
-  BUTTON_DDR  &= ~((1 << BUTTON_STOP_BIT) | (1 << BUTTON_RESET_BIT)); // inputs
-  BUTTON_PORT |=  (1 << BUTTON_STOP_BIT) | (1 << BUTTON_RESET_BIT);   // pull-ups
+  // Stop + Reset buttons (PC7, PC6) with pull-ups
+  BUTTON_DDR  &= ~((1 << BUTTON_STOP_BIT) | (1 << BUTTON_RESET_BIT));
+  BUTTON_PORT |=  (1 << BUTTON_STOP_BIT) | (1 << BUTTON_RESET_BIT);
 
-  // Start button 
-  DDRE  &= ~(1 << BUTTON_START_BIT);
-  PORTE |=  (1 << BUTTON_START_BIT);
-}
+  // Start button (PE4) with pull-up & external interrupt INT4
+  BUTTON_START_DDR  &= ~(1 << BUTTON_START_BIT);
+  BUTTON_START_PORT |=  (1 << BUTTON_START_BIT);
 
-//LED update 
-void updateLeds(void)
-{
-  // All off
-  LED_PORT &= ~((1 << LED_DISABLED_BIT) | (1 << LED_IDLE_BIT)   |  (1 << LED_ERROR_BIT)  | (1 << LED_RUNNING_BIT));
+  attachInterrupt(digitalPinToInterrupt(PIN_BTN_START),
+    onStartPressed, FALLING);
+}  
+
+// LEDs & Fan
+void updateLeds() {
+  // all off
+  LED_PORT &= ~((1 << LED_DISABLED_BIT) | (1 << LED_IDLE_BIT) | (1 << LED_ERROR_BIT)  | (1 << LED_RUNNING_BIT));
 
   switch (systemState) {
     case STATE_DISABLED:
-      LED_PORT |= (1 << LED_DISABLED_BIT);  // Yellow
+      LED_PORT |= (1 << LED_DISABLED_BIT);
       break;
     case STATE_IDLE:
-      LED_PORT |= (1 << LED_IDLE_BIT);      // Green
+      LED_PORT |= (1 << LED_IDLE_BIT);
       break;
     case STATE_ERROR:
-      LED_PORT |= (1 << LED_ERROR_BIT);     // Red
+      LED_PORT |= (1 << LED_ERROR_BIT);
       break;
     case STATE_RUNNING:
-      LED_PORT |= (1 << LED_RUNNING_BIT);   // Blue
+      LED_PORT |= (1 << LED_RUNNING_BIT);
       break;
   }
 }
 
-// Fan update
-// Fan ON only in RUNNING
-void updateFan(void)
-{
+void updateFanOutput() {
   if (systemState == STATE_RUNNING) {
     FAN_PORT |=  (1 << FAN_BIT);   // fan ON
   } else {
@@ -230,251 +291,273 @@ void updateFan(void)
   }
 }
 
-// State Change
-void setState(SystemState newState)
-{
+// States
+void setState(SystemState newState) {
   if (systemState != newState) {
     SystemState oldState = systemState;
     systemState = newState;
     updateLeds();
+    updateFanOutput();
+    updateLcd();
     logStateChange(oldState, newState);
+  }
+}
 
-    // reset LCD timer on every state change
-    lcdLastUpdateMs = 0;
-    if (systemState == STATE_DISABLED) {
-      disabledScreenShown = 0;
+// Buttons
+
+void handleButtons() {
+  unsigned long now = millis();
+
+  // read stop & reset PORTC 
+  int stopLevel  = (BUTTON_PIN_REG & (1 << BUTTON_STOP_BIT))  ? HIGH : LOW;
+  int resetLevel = (BUTTON_PIN_REG & (1 << BUTTON_RESET_BIT)) ? HIGH : LOW;
+
+  // Stop with debounce
+  if (stopLevel != lastStopLevel) {
+    lastStopLevel = stopLevel;
+    lastStopChangeMs = now;
+  }
+  if ((now - lastStopChangeMs) > STOP_DEBOUNCE_MS) {
+    if (stopLevel == LOW && !stopLatched) {
+      setState(STATE_DISABLED);
+      stopLatched = true;
+    } else if (stopLevel == HIGH) {
+      stopLatched = false;
+    }
+  }
+
+  // RESET only in ERROR
+  if (resetLevel == LOW && systemState == STATE_ERROR) {
+    if (!waterIsLow) {
+      setState(STATE_IDLE);
     }
   }
 }
 
-// Buttons + water sensor + state 
-void handleButtonsSensorsAndState(void)
-{
-  unsigned long now = millis();
-  uint8_t buttonPins = BUTTON_PIN_REG;
-  uint8_t stopRaw    = !(buttonPins & (1 << BUTTON_STOP_BIT));   // active low
-  uint8_t resetRaw   = !(buttonPins & (1 << BUTTON_RESET_BIT));  // active low
+// Sensors + transitions 
 
-  // Debounce STOP
-  static uint8_t       stopStable     = 0;
-  static uint8_t       stopLastRaw    = 0;
-  static unsigned long stopLastChange = 0;
-
-  if (stopRaw != stopLastRaw) {
-    stopLastRaw    = stopRaw;
-    stopLastChange = now;
+void sampleSensorsAndUpdateState() {
+  // water sensor with 16 sample average 
+  unsigned long sum = 0;
+  for (uint8_t i = 0; i < 16; ++i) {
+    sum += adc_read(WATER_ADC_CHANNEL);
   }
-  if ((now - stopLastChange) > 50) {   // 50 ms debounce
-    stopStable = stopRaw;
-  }
+  waterAdc = (unsigned int)(sum >> 4);
+  waterIsLow = (waterAdc < WATER_ADC_THRESHOLD);
 
-  // Debounce RESET
-  static uint8_t       resetStable     = 0;
-  static uint8_t       resetLastRaw    = 0;
-  static unsigned long resetLastChange = 0;
-
-  if (resetRaw != resetLastRaw) {
-    resetLastRaw    = resetRaw;
-    resetLastChange = now;
-  }
-  if ((now - resetLastChange) > 50) {
-    resetStable = resetRaw;
-  }
-
-  uint8_t stopPressed  = stopStable;
-  uint8_t resetPressed = resetStable;
-
-  // Start 
-  if (startPending) {
-    startPending = 0;
-
-    if (systemState == STATE_DISABLED) {
-      setState(STATE_IDLE);
-    }
-  }
-
-  // Stop
-  if (stopPressed) {
-    setState(STATE_DISABLED);
-    return;   
-  }
-
-  // Reset
-  if (resetPressed && systemState == STATE_ERROR) {
-    if (!isWaterLow()) {
-      setState(STATE_IDLE);
-    }
-  }
-
-  // IDLE/RUNNING (ERROR when water is low)
-  if (systemState == STATE_IDLE || systemState == STATE_RUNNING) {
-    if (isWaterLow()) {
+  if (waterIsLow) {
+    if (systemState != STATE_ERROR) {
       setState(STATE_ERROR);
-      return;   
     }
-  }
-
-  //Check for valid DHT
-  if (!hasValidDht) {
-    return;
-  }
-
-  // Check water level & temp thresholds
-  if (!isWaterLow()) {
-    if (systemState == STATE_IDLE && currentTempC >= TEMP_ON_THRESHOLD) {
-      setState(STATE_RUNNING);
-    } else if (systemState == STATE_RUNNING && currentTempC <= TEMP_OFF_THRESHOLD) {
-      setState(STATE_IDLE);
-    }
-  }
-}
-
-//ADC - Lab 8 
-void initAdc(void) 
-{
-  // Setup A register
-  *adcCtrlA = (1 << 7) | (0 << 5) | (0 << 3) | (1 << 2) | (1 << 1) | (1 << 0); 
-  // Setup B register
-  *adcCtrlB = (0 << 3) | (0 << 2) | (0 << 1) | (0 << 0); 
-
-  // Setup MUX register
-  *adcMux  = (0 << 7)  | (1 << 6) | (0 << 5)  | (0x00);                 
-}
-
-unsigned int readAdc(unsigned char channel)
-{
-  channel &= 0x07;   // only 0–7
-
-  *adcMux = (*adcMux & 0xE0) | (channel & 0x1F);
-  *adcCtrlB &= ~(1 << 3); 
-  *adcCtrlA |= (1 << 6);
-  while ((*adcCtrlA & (1 << 6)) != 0) {
-
-  }
-
-  unsigned int value = *adcData;
-  return value;
-}
-
-// Water sensor helper 
-uint8_t isWaterLow(void)
-{
-  unsigned int reading = readAdc(WATER_CHANNEL);
-  if (reading <= WATER_THRESHOLD) {
-    return 1;   // water low 
   } else {
-    return 0;   // water OK 
+    // DHT
+    float t = dht.readTemperature();
+    float h = dht.readHumidity();
+
+    if (!isnan(t) && !isnan(h)) {
+      currentTempC    = (int)t;
+      currentHumidity = (int)h;
+    }
+
+    if (!isnan(currentTempC)) {
+      if (systemState == STATE_IDLE && currentTempC >= TEMP_ON_C) {
+        setState(STATE_RUNNING);
+      } else if (systemState == STATE_RUNNING && currentTempC <= TEMP_OFF_C) {
+        setState(STATE_IDLE);
+      }
+    }
+  }
+
+  // status log with RTC 
+  logWithTimestampPrefix();
+  uartPrintStr("Status: ");
+  uartPrintStr(stateName(systemState));
+  uartPrintStr(" | T=");
+  if (isnan(currentTempC)) {
+    uartPrintStr("--C");
+  } else {
+    uartPrintUint((unsigned int)currentTempC);
+    uartPrintStr("C");
+  }
+  uartPrintStr(" H=");
+  if (isnan(currentHumidity)) {
+    uartPrintStr("--%");
+  } else {
+    uartPrintUint((unsigned int)currentHumidity);
+    uartPrintStr("%");
+  }
+  uartPrintStr(" | waterADC=");
+  uartPrintUint(waterAdc);
+  uartPrintStr(" | low=");
+  uartPutChar(waterIsLow ? '1' : '0');
+  uartPrintNewline();
+}
+
+// helper
+void lcdPrint2Digit(int v) {
+  if (v < 0) v = 0;
+  if (v > 99) v = 99;
+  if (v < 10) {
+    lcd.print('0');
+    lcd.print(v);
+  } else {
+    lcd.print(v);
   }
 }
 
-//  DHT11 helper 
-void updateDhtIfNeeded(void)
-{
-  // No monitoring of temp in DISABLED
-  if (systemState == STATE_DISABLED) {
-    return;
-  }
-
-  static unsigned long lastReadMs = 0;
-  unsigned long now = millis();
-
-  if (now - lastReadMs < 2000) {
-    return;
-  }
-  lastReadMs = now;
-
-  float h = dht.readHumidity();
-  float t = dht.readTemperature(); // Celsius
-
-  if (isnan(h) || isnan(t)) {
-    hasValidDht = 0;
-    return;
-  }
-
-  currentHumidity = (int)h;
-  currentTempC    = (int)t;
-  hasValidDht     = 1;
-}
-
-//LCD helper
-void updateLcdIfNeeded(void)
-{
-  if (systemState == STATE_DISABLED) {
-    return;
-  }
-
-  unsigned long now = millis();
-  if (now - lcdLastUpdateMs < LCD_UPDATE_PERIOD_MS) {
-    return;
-  }
-  lcdLastUpdateMs = now;
-
+// LCD 
+void updateLcd() {
   lcd.clear();
 
-  // Line 0
-  if (systemState == STATE_ERROR) {
-    lcd.setCursor(0, 0);
-    lcd.print("Error: Low Water");
-  } else {
-    lcd.setCursor(0, 0);
-    if (hasValidDht) {
-      lcd.print("T:");
-      lcd.print(currentTempC);
-      lcd.print("C H:");
-      lcd.print(currentHumidity);
-      lcd.print("%");
-    } else {
-      lcd.print("T:--C H:--%");
-    }
+  // Line 1
+  lcd.setCursor(0, 0);
+  // state name
+  switch (systemState) {
+    case STATE_DISABLED:
+      lcd.print("DISABLED");   
+      break;
+    case STATE_IDLE:
+      lcd.print("IDLE    ");   
+      break;
+    case STATE_RUNNING:
+      lcd.print("RUNNING ");   
+      break;
+    case STATE_ERROR:
+      lcd.print("ERROR   ");    
+      break;
   }
 
-  // Line 1
-  lcd.setCursor(0, 1);
-  if (systemState == STATE_IDLE) {
-    lcd.print("Mode: IDLE    ");
-  } else if (systemState == STATE_RUNNING) {
-    lcd.print("Mode: RUN     ");
-  } else if (systemState == STATE_ERROR) {
-    if (hasValidDht) {
-      lcd.print("T:");
-      lcd.print(currentTempC);
-      lcd.print("C H:");
-      lcd.print(currentHumidity);
-      lcd.print("%");
-    } else {
-      lcd.print("T:--C H:--%");
-    }
+  lcd.print('T');
+  if (isnan(currentTempC) || systemState == STATE_DISABLED) {
+    lcd.print("--");
   } else {
-    lcd.print("Unknown state ");
+    lcdPrint2Digit((int)currentTempC);
+  }
+
+  lcd.print(' ');
+  lcd.print('H');
+  if (isnan(currentHumidity) || systemState == STATE_DISABLED) {
+    lcd.print("--");
+  } else {
+    lcdPrint2Digit((int)currentHumidity);
+  }
+
+  // line 2
+  lcd.setCursor(0, 1);
+  switch (systemState) {
+    case STATE_DISABLED:
+      lcd.print("Cooler OFF Start");   
+      break;
+
+    case STATE_IDLE:
+      if (waterIsLow) {
+        lcd.print("Low water ->ERR ");
+      } else {
+        lcd.print("Ready,monitoring"); 
+      }
+      break;
+
+    case STATE_RUNNING:
+      lcd.print("Fan ON, cooling ");  
+      break;
+
+    case STATE_ERROR:
+      if (waterIsLow) {
+        lcd.print("Low water! Reset"); 
+      } else {
+        lcd.print("Error! Press Rst"); 
+      }
+      break;
+  }
+} 
+
+//Stepper
+void updateVentFromPot() {
+  int pot = (int)adc_read(1);   // A1 = channel 1
+
+  long target = map(pot, 0, 1023, 0, VENT_MAX_STEPS);
+  long delta = target - ventCurrentSteps;
+  if (delta == 0) return;
+
+  long stepsToMove = delta;
+  if (stepsToMove > VENT_STEP_CHUNK)  stepsToMove = VENT_STEP_CHUNK;
+  if (stepsToMove < -VENT_STEP_CHUNK) stepsToMove = -VENT_STEP_CHUNK;
+
+  ventStepper.step((int)stepsToMove);
+  ventCurrentSteps += stepsToMove;
+}
+
+// RTC helpers 
+const char* stateName(SystemState s) {
+  switch (s) {
+    case STATE_DISABLED: return "DISABLED";
+    case STATE_IDLE:     return "IDLE";
+    case STATE_RUNNING:  return "RUNNING";
+    case STATE_ERROR:    return "ERROR";
+    default:             return "?";
   }
 }
 
-//  UART helpers
+void initRTC() {
+  Wire.begin();
+  if (!rtc.begin()) {
+    rtcOK = false;
+    uartPrintStr("RTC init failed (no module?)");
+    uartPrintNewline();
+    return;
+  }
+  rtcOK = true;
+  uartPrintStr("RTC initialized.");
+  uartPrintNewline();
+}
+
+void logWithTimestampPrefix() {
+  if (!rtcOK) {
+    uartPrintStr("[no-RTC] ");
+    return;
+  }
+
+  DateTime now = rtc.now();
+  uartPutChar('[');
+  uartPrintUint(now.year());
+  uartPutChar('-');
+  uartPrint2Digit(now.month());
+  uartPutChar('-');
+  uartPrint2Digit(now.day());
+  uartPutChar(' ');
+  uartPrint2Digit(now.hour());
+  uartPutChar(':');
+  uartPrint2Digit(now.minute());
+  uartPutChar(':');
+  uartPrint2Digit(now.second());
+  uartPutChar(']');
+  uartPutChar(' ');
+}
+
+void logStateChange(SystemState fromState, SystemState toState) {
+  logWithTimestampPrefix();
+  uartPrintStr("State change: ");
+  uartPrintStr(stateName(fromState));
+  uartPrintStr(" -> ");
+  uartPrintStr(stateName(toState));
+  uartPrintNewline();
+}
+
+//UART
 void uartInit(int baud)
 {
   unsigned long FCPU = 16000000UL;
   unsigned int tbaud = (unsigned int)(FCPU / 16UL / baud - 1UL);
 
-  *uartStatusA  = 0x20;   
-  *uartControlB = 0x18;  
-  *uartControlC = 0x06;  
+  *uartStatusA  = 0x20;   // clear flags
+  *uartControlB = 0x18;   // RXEN0 | TXEN0
+  *uartControlC = 0x06;   // 8 data, 1 stop, no parity
   *uartBaud     = tbaud;
-}
-
-unsigned char uartKbHit(void)
-{
-  return *uartStatusA & RDA;
-}
-
-unsigned char uartGetChar(void)
-{
-  return *uartData;
 }
 
 void uartPutChar(unsigned char c)
 {
   while ((*uartStatusA & TBE) == 0) {
-    
   }
   *uartData = c;
 }
@@ -512,110 +595,10 @@ void uartPrintUint(unsigned int x)
   }
 }
 
-const char* stateToString(SystemState s)
-{
-  switch (s) {
-    case STATE_DISABLED: return "DISABLED";
-    case STATE_IDLE:     return "IDLE";
-    case STATE_RUNNING:  return "RUNNING";
-    case STATE_ERROR:    return "ERROR";
-    default:             return "UNKNOWN";
-  }
-}
-
-void logStateChange(SystemState oldState, SystemState newState)
-{
-  logWithTimestampPrefix();
-  uartPrintStr("State change: ");
-  uartPrintStr(stateToString(oldState));
-  uartPrintStr(" -> ");
-  uartPrintStr(stateToString(newState));
-  uartPrintNewline();
-}
-
-void logStatusIfNeeded(void)
-{
- // No monitoring/logging in DISABLED
-  if (systemState == STATE_DISABLED) {
-    return;
-  }
-
-  static unsigned long lastLogMs = 0;
-  unsigned long now = millis();
-
-  if (now - lastLogMs >= 1000) {   // every second
-    lastLogMs = now;
-    unsigned int reading = readAdc(WATER_CHANNEL);
-
-    uartPrintStr("Status: ");
-    uartPrintStr(stateToString(systemState));
-    uartPrintStr(" | ");
-
-    if (hasValidDht) {
-      uartPrintStr("T=");
-      uartPrintUint((unsigned int)currentTempC);
-      uartPrintStr("C H=");
-      uartPrintUint((unsigned int)currentHumidity);
-      uartPrintStr("% | ");
-    } else {
-      uartPrintStr("T=-- H=-- | ");
-    }
-
-    uartPrintStr("waterADC=");
-    uartPrintUint(reading);
-    uartPrintStr(" | low=");
-    uartPutChar(isWaterLow() ? '1' : '0');
-    uartPrintNewline();
-  }
-}
-
-// RTC helpers
-void initRtc(void)
-{
-  Wire.begin();
-
-  if (!rtc.begin()) {
-    rtcOK = 0;
-    uartPrintStr("RTC init failed");
-    uartPrintNewline();
-    return;
-  }
-
-  rtcOK = 1;
-
-  uartPrintStr("RTC initialized");
-  uartPrintNewline();
-}
-
 void uartPrint2Digit(uint8_t v)
 {
   if (v < 10) {
     uartPutChar('0');
   }
-  uartPrintUint((unsigned int)v);
-}
-
-void logWithTimestampPrefix(void)
-{
-  if (!rtcOK) {
-    uartPrintStr("[no-RTC] ");
-    return;
-  }
-
-  DateTime now = rtc.now();
-
-  uartPutChar('[');
-  uartPrintUint(now.year());
-  uartPutChar('-');
-  uartPrint2Digit(now.month());
-  uartPutChar('-');
-  uartPrint2Digit(now.day());
-  uartPutChar(' ');
-  uartPrint2Digit(now.hour());
-  uartPutChar(':');
-  uartPrint2Digit(now.minute());
-  uartPutChar(':');
-  uartPrint2Digit(now.second());
-  uartPutChar(']');
-  uartPutChar(' ');
+  uartPrintUint(v);
 }
