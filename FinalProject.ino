@@ -144,7 +144,7 @@ void setupPins(void)
   DDRE  &= ~(1 << BUTTON_START_BIT);
   PORTE |=  (1 << BUTTON_START_BIT);
 
-  /
+  
 }
 
 //LED update 
