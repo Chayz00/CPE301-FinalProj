@@ -3,7 +3,7 @@ Group#: 43
 Members: Chayton Zuniga & Inshallah Baca 
 
 Project Overview: 
-  This project implments a swamp cooler controller using an Adruino Uno. It monitors the temperature, humidity, and water level. Using these readings and user input it controls a fan, a set of state status LEDs, a LCD, and a stepper motor controled via a potentiometer. We use a RTC to timestamo the status log and state transitions. The water level sensor is read using a direct register level ADC. 
+  This project implments a swamp cooler controller using an Adruino AtMega2560. It monitors the temperature, humidity, and water level. Using these readings and user input it controls a fan, a set of state status LEDs, a LCD, and a stepper motor controled via a potentiometer. We use a RTC to timestamp the status log and state transitions. The water level sensor is read using a direct register level ADC. 
 
   The controller uses a four states: 
           Disabled - System off, LED on, no monitoring, no fan, no stepper motor. 
@@ -11,7 +11,7 @@ Project Overview:
           Error - Low water fan forced off, forced idle off. 
           Running - Fan on system cooling. 
 
-  Buttons are used for state transitions as well as water & temperature/humidity sensor: 
+  Buttons are used for state transitions as well as the water & temperature/humidity sensors: 
       Start: External interrupt (pin 2) 
       Stop: with software debounce
       Reset: Recovers from Error when water level fixed
@@ -19,7 +19,7 @@ Project Overview:
       Temperature/humidity: DTH11 
 
 Hardware and Pin assignment:
-Microcontroller: Arduino Uno
+Microcontroller: Arduino AtMega2560
 
 Inputs:
 Start button: D2 (INT4, INPUT_PULLUP, falling-edge interrupt)
@@ -37,7 +37,7 @@ Disabled (yellow): D22
 Idle (green): D23
 Error (red): D24
 Running (blue): D25
-Fan control: D6 -> PN2222 transistor -> blower fan (ON only in RUNNING)
+Fan control: D6 -> PN2222 transistor -> fan (ON only in RUNNING)
 LCD 16×2: LiquidCrystal lcd(8, 9, 10, 11, 12, 13)
 Vent stepper: IN1–IN4 on D32, D33, D34, D35
 RTC DS3231: used to prefix serial logs.
@@ -50,8 +50,8 @@ Start button: DISABLED → IDLE
 Stop button: any state → DISABLED (fan OFF, monitoring OFF)
 Water low (waterAdc < 200): IDLE/RUNNING -> ERROR
 Reset button: ERROR -> IDLE if water level OK
-Temperature (DHT11, °C): currentTempC ≥ 26.0 -> STATE_RUNNING, fan ON
-                         currentTempC ≤ 24.0 ->  STATE_IDLE, fan OFF
+Temperature (DHT11, °C): currentTempC >= 26.0 -> STATE_RUNNING, fan ON
+                         currentTempC <= 24.0 ->  STATE_IDLE, fan OFF
 
 
 Build & Run Instructions:
